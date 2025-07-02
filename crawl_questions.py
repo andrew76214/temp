@@ -1,90 +1,77 @@
-#!/usr/bin/env python3
-"""
-抓取 Confluence Questions > Topics 底下所有 QA
-執行範例：
-    python crawl_questions.py --base https://confluence.example.com
-輸出：confluence_questions.json
-"""
-
-import json, re, time, argparse
-from urllib.parse import urljoin, urlparse, parse_qs
-import requests, browser_cookie3
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from bs4 import BeautifulSoup
 from tqdm import tqdm
+import json, time
 
-CSS_TOPIC_LINK   = "a.aui-nav-link"                 # Topic 列表頁的 topic 連結
-CSS_QUEST_LINK   = "a.question-link"                # Topic 內每題的連結
-CSS_PAGINATION   = "a.aui-nav-next"                 # 下一頁按鈕
-CSS_QUESTION_TTL = "h1.question-title"
-CSS_QUESTION_BDY = "div.question-body"
-CSS_ANSWER_BODIES = "div.answer"
+BASE_URL = "https://conf.example.com"
 
-def build_session(domain: str) -> requests.Session:
-    """沿用 Edge Cookie，建立已登入的 Session"""
-    cj = browser_cookie3.edge(domain_name=domain)
-    sess = requests.Session()
-    sess.cookies.update(cj)
-    sess.headers.update({"User-Agent": "Mozilla/5.0 (Edge crawler)"})
-    return sess
+SEL_TOPIC_LINK   = 'a[href^="/questions/topic"]'
+SEL_NEXT_PAGE    = 'a[rel="next"], a.aui-nav-next[href*="page="]'
+SEL_QUEST_LINK   = 'a[href^="/questions/"]:not([href*="/topic"])'
+SEL_TOPIC_TAGS   = 'ul.question-topics a, a[data-tag]'
+SEL_SHOW_MORE    = 'button.show-more, a.show-more'   # 視版本調整
 
-def get_soup(sess: requests.Session, url: str) -> BeautifulSoup:
-    resp = sess.get(url, timeout=30)
-    resp.raise_for_status()
-    return BeautifulSoup(resp.text, "html.parser")
+def scroll_to_bottom(page, step=1500, wait=1000):
+    """滑到最底並等待新資料載入；回傳 True=有新高度"""
+    prev = -1
+    while True:
+        curr = page.evaluate("() => document.body.scrollHeight")
+        if curr == prev:
+            break
+        prev = curr
+        page.evaluate(f"() => window.scrollBy(0, {step})")
+        page.wait_for_timeout(wait)
 
-def list_topics(sess: requests.Session, base_url: str):
-    url = urljoin(base_url, "/questions/topics")
-    soup = get_soup(sess, url)
-    for a in soup.select(CSS_TOPIC_LINK):
-        yield a.text.strip(), urljoin(base_url, a["href"])
+def click_show_more_all(page, selector=SEL_SHOW_MORE):
+    """反覆點擊 show-more 類按鈕直到消失"""
+    while True:
+        try:
+            btn = page.locator(selector).first
+            btn.wait_for(state="visible", timeout=1000)
+            btn.click()
+            page.wait_for_timeout(800)
+        except PWTimeout:
+            break
 
-def paginate(sess: requests.Session, topic_url: str):
-    """迭代 topic 下所有分頁"""
-    next_url = topic_url
-    while next_url:
-        soup = get_soup(sess, next_url)
-        yield soup
-        nxt = soup.select_one(CSS_PAGINATION)
-        next_url = urljoin(topic_url, nxt["href"]) if nxt else None
+def parse_question_html(html, q_url):
+    soup = BeautifulSoup(html, "html.parser")
+    title = soup.select_one("h1.question-title, h1#title-text").get_text(strip=True)
+    question = soup.select_one("div.question-body, div.content-body").get_text("\n", strip=True)
+    answers = [a.get_text("\n", strip=True) for a in soup.select("div.answer, div.comment-answer")]
+    tags = sorted({t.get_text(strip=True).lower() for t in soup.select(SEL_TOPIC_TAGS)})
+    return {"url": q_url, "title": title, "question": question,
+            "answers": answers, "keywords": tags}
 
-def list_questions(sess: requests.Session, topic_url: str):
-    """回傳 (title, url)"""
-    for soup in paginate(sess, topic_url):
-        for a in soup.select(CSS_QUEST_LINK):
-            yield a.text.strip(), urljoin(topic_url, a["href"])
+def crawl(output="confluence_QA.json"):
+    items = []
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(storage_state="state.json")  
+        # 建議：先手動用 Edge 登入一次 → 把 cookie 匯出成 state.json
+        page = ctx.new_page()
+        page.goto(f"{BASE_URL}/questions/topics", timeout=60000)
 
-def fetch_qa(sess: requests.Session, q_url: str):
-    soup = get_soup(sess, q_url)
-    q_title = soup.select_one(CSS_QUESTION_TTL).text.strip()
-    q_body  = soup.select_one(CSS_QUESTION_BDY).get_text("\n", strip=True)
-    answers = [a.get_text("\n", strip=True) for a in soup.select(CSS_ANSWER_BODIES)]
-    return {"url": q_url, "title": q_title, "question": q_body, "answers": answers}
+        # ── A. 取得所有 Topic 連結 ────────────────────
+        scroll_to_bottom(page)                       # 滾到底把列表拉完
+        topic_links = [a.get_attribute("href") for a in page.query_selector_all(SEL_TOPIC_LINK)]
 
-def crawl(base_url: str, out_file: str = "confluence_questions.json"):
-    domain = urlparse(base_url).hostname
-    sess = build_session(domain)
-    data = []
+        for t_link in topic_links:
+            full_topic = BASE_URL + t_link
+            page.goto(full_topic, timeout=60000)
+            scroll_to_bottom(page)                   # topic 列表若是 infinite scroll
 
-    print("⏳ 取得 Topics 列表…")
-    for topic_name, topic_url in list_topics(sess, base_url):
-        print(f"🔍 Topic: {topic_name}")
-        for q_title, q_url in tqdm(list_questions(sess, topic_url), desc="  抓 Question"):
-            try:
-                qa = fetch_qa(sess, q_url)
-                qa["topic"] = topic_name
-                data.append(qa)
-            except Exception as e:
-                print(f"⚠️  無法抓取 {q_url}: {e}")
+            q_links = {a.get_attribute("href") for a in page.query_selector_all(SEL_QUEST_LINK)}
+            for q_link in tqdm(q_links, desc=f"Topic {t_link.split('/')[-1]}"):
+                q_url = BASE_URL + q_link
+                page.goto(q_url, timeout=60000)
+                click_show_more_all(page)            # B. 點 show more
+                qa = parse_question_html(page.content(), q_url)
+                items.append(qa)
+                time.sleep(0.3)                      # 禮貌等待
 
-            time.sleep(0.5)  # 溫和一點，避免伺服器過載
-
-    with open(out_file, "w", encoding="utf-8") as fp:
-        json.dump(data, fp, ensure_ascii=False, indent=2)
-    print(f"✅ 完成！共 {len(data)} 筆，存檔 {out_file}")
+        json.dump(items, open(output, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        print(f"✅ {len(items)} QA saved → {output}")
+        browser.close()
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--base", required=True, help="Confluence 基底 URL，例如 https://conf.example.com")
-    ap.add_argument("--out", default="confluence_questions.json", help="輸出檔名")
-    args = ap.parse_args()
-    crawl(args.base.rstrip("/"), args.out)
+    crawl()
