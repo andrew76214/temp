@@ -1,112 +1,57 @@
-import os
-import requests
-import time
-import json
-from tqdm import tqdm
+import os, time, concurrent.futures, requests
+from bs4 import BeautifulSoup
 
-BASE_URL = os.getenv("CONFLUENCE_BASE_URL")   # 例如 https://xxx.atlassian.net/wiki
-AUTH = ("", os.getenv("CONFLUENCE_PAT"))
-HEADERS = {"Accept": "application/json"}
+BASE   = "https://wiki.company.local"
+TOKEN  = os.getenv("CONF_PAT")          # 建議放環境變數
+HEAD   = {"Authorization": f"Bearer {TOKEN}"}
 
-def fetch_paginated(endpoint, params=None):
-    url = f"{BASE_URL}/rest/api/{endpoint}"
+def list_page_ids(space_key: str, limit=200):
     start = 0
     while True:
-        p = params.copy() if params else {}
-        p.update({"start": start, "limit": 50})
-        r = requests.get(url, params=p, auth=AUTH, headers=HEADERS)
+        url = f"{BASE}/rest/api/content"
+        params = dict(spaceKey=space_key, type="page", start=start,
+                      limit=limit, expand="")         # 只拿 meta
+        r = requests.get(url, headers=HEAD, params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
-        for item in data.get("results", []):
-            yield item
-        if not data.get("links", {}).get("next"):
+        for p in data["results"]:
+            yield p["id"]
+        if data["_links"].get("next") is None:
             break
-        start += data["size"]
-        time.sleep(0.05)
+        start += limit
 
-def get_spaces():
-    return list(fetch_paginated("space", {"type": "global"}))
-
-def get_pages(space_key):
-    return fetch_paginated("content", {
-        "spaceKey": space_key,
-        "type": "page",
-        "expand": "body.storage,version,ancestors,history,metadata.labels"
-    })
-
-def get_page_children(page_id):
-    return fetch_paginated(f"content/{page_id}/child/page", {
-        "expand": "body.storage,version,ancestors,history"
-    })
-
-def get_attachments(page_id):
-    return list(fetch_paginated(f"content/{page_id}/child/attachment", {
-        "expand": "version,container"
-    }))
-
-def get_comments(page_id):
-    return list(fetch_paginated(f"content/{page_id}/child/comment", {
-        "expand": "body.storage,version,history"
-    }))
-
-def doc_meta(content):
-    # 基礎內容結構
-    meta = {
-        "id": content["id"],
-        "type": content["type"],
-        "title": content["title"],
-        "space_key": content["space"]["key"] if "space" in content else None,
-        "parent_id": content["ancestors"][-1]["id"] if content.get("ancestors") else None,
-        "version": content.get("version", {}).get("number"),
-        "created_by": content.get("history", {}).get("createdBy", {}).get("displayName"),
-        "created_at": content.get("history", {}).get("createdDate"),
-        "updated_at": content.get("version", {}).get("when"),
-        "labels": [l.get("name") for l in content.get("metadata", {}).get("labels", {}).get("results", [])] if "metadata" in content else [],
-        "body": content.get("body", {}).get("storage", {}).get("value", ""),
-        "attachments": [],
-        "comments": [],
-        "children": [],
-    }
-    return meta
-
-def parse_attachment(att):
+def fetch_page(pid: str):
+    url = f"{BASE}/rest/api/content/{pid}"
+    params = dict(
+        expand="body.storage,metadata.labels,ancestors,version,space"
+    )
+    r = requests.get(url, headers=HEAD, params=params, timeout=30)
+    r.raise_for_status()
+    j = r.json()
+    html = j["body"]["storage"]["value"]
+    text = BeautifulSoup(html, "lxml").get_text("\n")
     return {
-        "id": att["id"],
-        "file_name": att["title"],
-        "media_type": att.get("metadata", {}).get("mediaType", ""),
-        "download_link": att["_links"].get("download"),
-        "created_at": att.get("version", {}).get("when"),
-        "created_by": att.get("version", {}).get("by", {}).get("displayName"),
+        "id": pid,
+        "title": j["title"],
+        "text": text,
+        "labels": [l["name"] for l in j["metadata"]["labels"]["results"]],
+        "version": j["version"]["number"],
+        "updated": j["version"]["when"],
+        "ancestors": [a["title"] for a in j["ancestors"]],
+        "space": j["space"]["key"],
+        "url": f'{BASE}{j["_links"]["webui"]}',
     }
 
-def parse_comment(c):
-    return {
-        "id": c["id"],
-        "author": c.get("history", {}).get("createdBy", {}).get("displayName"),
-        "created_at": c.get("history", {}).get("createdDate"),
-        "body": c.get("body", {}).get("storage", {}).get("value", ""),
-    }
+def crawl_space(space_key):
+    pids = list(list_page_ids(space_key))
+    print(f"[{space_key}] total pages: {len(pids)}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        for data in ex.map(fetch_page, pids):
+            yield data            # 這裡可直接寫入 DB 或檔案
 
-def parse_child(child):
-    return {"id": child["id"], "title": child["title"]}
-
-def build_dataset(output_file="confluence_rag_dataset.jsonl"):
-    with open(output_file, "w", encoding="utf-8") as fout:
-        for space in get_spaces():
-            skey = space["key"]
-            print(f"=== Crawling SPACE: {skey} ===")
-            for page in tqdm(get_pages(skey), desc=f"Pages in {skey}"):
-                doc = doc_meta(page)
-                # 附件
-                attachments = get_attachments(page["id"])
-                doc["attachments"] = [parse_attachment(a) for a in attachments]
-                # 評論
-                comments = get_comments(page["id"])
-                doc["comments"] = [parse_comment(c) for c in comments]
-                # 子頁面（僅記錄基本資訊，不遞迴抓內容）
-                children = get_page_children(page["id"])
-                doc["children"] = [parse_child(child) for child in children]
-                fout.write(json.dumps(doc, ensure_ascii=False) + "\n")
-
+# ------- example run -------
 if __name__ == "__main__":
-    build_dataset()
+    for space in ("DEV", "OPS"):
+        for doc in crawl_space(space):
+            # TODO: clean HTML → Markdown，再寫入向量 DB
+            pass
